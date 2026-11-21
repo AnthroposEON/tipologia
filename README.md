@@ -1,0 +1,2 @@
+# tipologia
+Análisis tipológico
