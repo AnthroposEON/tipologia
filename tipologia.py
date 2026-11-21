@@ -1,25 +1,21 @@
 import numpy as np
 import pandas as pd
 
-# ==========================================
-# 1. EXTRACCIÓN DE PHOIBLE Y GLOTTOLOG
-# ==========================================
-url_phoible = (
-    "https://githubusercontent.com"
-)
-url_glottolog = "https://githubusercontent.com"
+# 1. Descargar datos
+url_phoible = "https://raw.githubusercontent.com/phoible/phoible/master/data/phoible.csv"
+url_glottolog = "https://raw.githubusercontent.com/glottolog/glottolog-cldf/master/cldf/languages.csv"
 
-print("Descargando bases de datos...")
 phoible = pd.read_csv(url_phoible, low_memory=False)
 glotto = pd.read_csv(url_glottolog, low_memory=False)
 
-# Filtrar vocales con marca de longitud 'ː' (puedes refinar si quieres excluir diptongos)
+nombres_familias = dict(zip(glotto["ID"], glotto["Name"]))
+
+# 2. Filtrar vocales largas en PHOIBLE
 vocales_largas = phoible[
     (phoible["SegmentClass"] == "vowel")
     & (phoible["Phoneme"].str.contains("ː", na=False))
 ]
 
-# Contar cuántas vocales largas reporta cada lengua y quedarnos con Glottocodes únicos
 candidatas = (
     vocales_largas.groupby(["Glottocode", "ISO6393", "LanguageName"])["Phoneme"]
     .apply(lambda x: ", ".join(sorted(set(x))))
@@ -27,76 +23,65 @@ candidatas = (
     .rename(columns={"Phoneme": "Vocales_Largas"})
 )
 
-# Cruzar con Glottolog para obtener Familia, Macroárea y Coordenadas
-glotto_clean = glotto[[
-    "ID",
-    "Name",
-    "Family_ID",
-    "Macroarea",
-    "Latitude",
-    "Longitude",
-    "Classification",
-]].rename(columns={"ID": "Glottocode"})
+# 3. Cruzar con Glottolog y limpiar categorías no genealógicas
+glotto_clean = glotto[
+    ["ID", "Family_ID", "Macroarea", "Latitude", "Longitude"]
+].rename(columns={"ID": "Glottocode"})
 df_master = pd.merge(candidatas, glotto_clean, on="Glottocode", how="inner")
 
-# Limpiar lenguas sin coordenadas o aisladas (a las aisladas les asignamos su propio Glottocode como familia)
 df_master["Family_ID"] = df_master["Family_ID"].fillna(df_master["Glottocode"])
+df_master["Nombre_Familia"] = (
+    df_master["Family_ID"].map(nombres_familias).fillna("Aislada")
+)
+
+# Excluir categorías administrativas de Glottolog (Bookkeeping, Unclassifiable, etc.)
+familias_excluir = [
+    "Bookkeeping",
+    "Unclassifiable",
+    "Artificial Language",
+    "Speech Register",
+    "Sign Language",
+]
+df_master = df_master[~df_master["Nombre_Familia"].isin(familias_excluir)]
 df_master = df_master.dropna(subset=["Latitude", "Longitude"]).reset_index(
     drop=True
 )
 
-print(
-    f"Total de lenguas únicas con vocales largas y coordenadas: {len(df_master)}"
+# 4. Cálculo de Diversidad Filogenética (Raíz cuadrada + Restos mayores)
+tamano_real_glotto = glotto["Family_ID"].value_counts().to_dict()
+
+diversidad = (
+    df_master.groupby(["Family_ID", "Nombre_Familia"])
+    .agg(
+        Candidatas_Con_VL=("Glottocode", "count"),
+        Macroareas=("Macroarea", lambda x: ", ".join(sorted(set(x.dropna())))),
+    )
+    .reset_index()
 )
 
-
-# ==========================================
-# 2. DIVERSIDAD FILOGENÉTICA (Aprox. Rijkhoff & Bakker)
-# ==========================================
-# Calculamos el peso de diversidad de cada familia contando sus ramas únicas en la clasificación
-def calcular_dv(grupo):
-  # Cuenta cuántos nodos distintos existen en los niveles de clasificación de la familia
-  niveles = set()
-  for ruta in grupo["Classification"].dropna():
-    partes = ruta.split("/")
-    for i, nodo in enumerate(partes):
-      niveles.add((i, nodo))
-  # Si es lengua aislada (sin '/') le damos valor base 1
-  return max(1, len(niveles))
-
-
-dv_familias = (
-    df_master.groupby("Family_ID")
-    .apply(calcular_dv)
-    .reset_index(name="DV_Score")
+diversidad["Tamano_Glottolog"] = (
+    diversidad["Family_ID"].map(tamano_real_glotto).fillna(1)
 )
-dv_familias["Proporcion"] = (
-    dv_familias["DV_Score"] / dv_familias["DV_Score"].sum()
-)
+diversidad["Peso_Diversidad"] = np.sqrt(diversidad["Tamano_Glottolog"])
 
-# Asignar cuotas para N = 50 usando el método de restos mayores (Largest Remainder Method)
 N_MUESTRA = 50
-dv_familias["Cuota_Exacta"] = dv_familias["Proporcion"] * N_MUESTRA
-dv_familias["Cuota_Entera"] = np.floor(dv_familias["Cuota_Exacta"]).astype(int)
-dv_familias["Residuo"] = dv_familias["Cuota_Exacta"] - dv_familias["Cuota_Entera"]
+diversidad["Cuota_Exacta"] = (
+    diversidad["Peso_Diversidad"] / diversidad["Peso_Diversidad"].sum()
+) * N_MUESTRA
+diversidad["Cuota_Entera"] = np.floor(diversidad["Cuota_Exacta"]).astype(int)
+diversidad["Residuo"] = diversidad["Cuota_Exacta"] - diversidad["Cuota_Entera"]
 
-faltantes = N_MUESTRA - dv_familias["Cuota_Entera"].sum()
-indices_top = dv_familias.nlargest(faltantes, "Residuo").index
-dv_familias.loc[indices_top, "Cuota_Entera"] += 1
+faltantes = N_MUESTRA - diversidad["Cuota_Entera"].sum()
+diversidad.loc[diversidad.nlargest(faltantes, "Residuo").index, "Cuota_Entera"] += 1
 
-# Filtrar solo familias que obtuvieron al menos 1 cupo
-cuotas_finales = dv_familias[dv_familias["Cuota_Entera"] > 0].sort_values(
+cuotas_finales = diversidad[diversidad["Cuota_Entera"] > 0].sort_values(
     by="Cuota_Entera", ascending=False
 )
-print("\nDistribución de cupos por familia (Top 10):")
-print(cuotas_finales[["Family_ID", "DV_Score", "Cuota_Entera"]].head(10))
 
 
-# ==========================================
-# 3. FILTRO ESPACIAL (HAVERSINE) PARA SELECCIONAR LAS 50
-# ==========================================
+# 5. Selección espacial (Fórmula de Haversine para maximizar distancia entre lenguas)
 def haversine(lat1, lon1, lat2, lon2):
-  R = 6371.0  # Radio de la Tierra en km
+  R = 6371.0
   phi1, phi2 = np.radians(lat1), np.radians(lat2)
   dphi = np.radians(lat2 - lat1)
   dlambda = np.radians(lon2 - lon1)
@@ -108,26 +93,26 @@ def haversine(lat1, lon1, lat2, lon2):
 
 
 seleccionadas = []
-np.random.seed(42)  # Para que tu selección sea 100% reproducible
+np.random.seed(42)
 
 for _, row in cuotas_finales.iterrows():
   fam = row["Family_ID"]
   cupos = row["Cuota_Entera"]
   candidatas_fam = df_master[df_master["Family_ID"] == fam].copy()
 
-  # Si solo hay 1 lengua o pide todas las disponibles en esa familia
+  # Priorizar las lenguas que tienen más vocales largas documentadas (mejor descripción fonética)
+  candidatas_fam["Num_VL"] = candidatas_fam["Vocales_Largas"].apply(
+      lambda x: len(x.split(", "))
+  )
+  candidatas_fam = candidatas_fam.sort_values(
+      by=["Num_VL", "LanguageName"], ascending=[False, True]
+  )
+
   if len(candidatas_fam) <= cupos:
     seleccionadas.append(candidatas_fam)
   else:
-    # Elegir la que tenga más vocales largas documentadas como ancla inicial
-    candidatas_fam["Num_Vocales"] = candidatas_fam["Vocales_Largas"].apply(
-        lambda x: len(x.split(", "))
-    )
-    elegidas_fam = [
-        candidatas_fam.sort_values(by="Num_Vocales", ascending=False).iloc[0]
-    ]
-
-    # Para cupos adicionales, maximizar distancia geográfica respecto a las ya seleccionadas
+    # CORRECCIÓN: Usar .iloc[0] para obtener la primera fila
+    elegidas_fam = [candidatas_fam.iloc[0]]
     while len(elegidas_fam) < cupos:
       restantes = candidatas_fam[
           ~candidatas_fam["Glottocode"].isin(
@@ -137,17 +122,17 @@ for _, row in cuotas_finales.iterrows():
       mejor_cand = None
       max_dist_minima = -1
 
+      todas_previas = [
+          e
+          for sub in seleccionadas
+          for _, e in (
+              sub.iterrows()
+              if isinstance(sub, pd.DataFrame)
+              else enumerate([sub])
+          )
+      ] + elegidas_fam
+
       for _, cand in restantes.iterrows():
-        # Distancia mínima a cualquier lengua ya elegida en toda la muestra
-        todas_previas = [
-            e
-            for sub in seleccionadas
-            for _, e in (
-                sub.iterrows()
-                if isinstance(sub, pd.DataFrame)
-                else enumerate([sub])
-            )
-        ] + elegidas_fam
         dists = [
             haversine(
                 cand["Latitude"], cand["Longitude"], p["Latitude"], p["Longitude"]
@@ -155,7 +140,6 @@ for _, row in cuotas_finales.iterrows():
             for p in todas_previas
         ]
         dist_min = min(dists) if dists else 0
-
         if dist_min > max_dist_minima:
           max_dist_minima = dist_min
           mejor_cand = cand
@@ -163,9 +147,16 @@ for _, row in cuotas_finales.iterrows():
       elegidas_fam.append(mejor_cand)
     seleccionadas.append(pd.DataFrame(elegidas_fam))
 
-muestra_final = pd.concat(seleccionadas).reset_index(drop=True)
-muestra_final.to_csv("muestra_50_lenguas_vocales_largas.csv", index=False)
+muestra_final = pd.concat(seleccionadas).drop(columns=["Num_VL"]).reset_index(
+    drop=True
+)
+muestra_final.to_csv("muestra_50_lenguas_limpia.csv", index=False)
+
+print("Resumen por Macroárea en la muestra final:")
+print(muestra_final["Macroarea"].value_counts(dropna=False))
+print("\nPrimeras 15 lenguas seleccionadas:")
 print(
-    f"\n¡Listo! Muestra generada con {len(muestra_final)} lenguas y guardada en"
-    " CSV."
+    muestra_final[
+        ["LanguageName", "ISO6393", "Nombre_Familia", "Macroarea", "Vocales_Largas"]
+    ].head(15)
 )
